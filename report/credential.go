@@ -50,7 +50,7 @@ type CredentialComponentReport struct {
 
 // NewCredentialReport builds a redacted report from a validated or analyzed finding.
 func NewCredentialReport(finding Finding, secrets []string) CredentialReport {
-	secrets = credentialSecretsForRedaction(secrets)
+	secrets = credentialEncodedSecretsForRedaction(secrets)
 	result := CredentialReport{
 		SchemaVersion: SchemaVersion,
 		RuleID:        sanitizeCredentialString(finding.RuleID, secrets),
@@ -175,23 +175,54 @@ func credentialSecretsForRedaction(secrets []string) []string {
 	return ordered
 }
 
-// HTTP diagnostics may contain encoded credential values in URLs and bodies.
-// Expand only for debug output; normal report metadata retains its usual rules.
-func credentialDebugSecretsForRedaction(secrets []string) []string {
+// credentialSecretVariants returns the encoded equivalents of a credential:
+// JSON-escaped (with and without HTML escaping), URL query/path escaped, and
+// the four standard Base64 alphabets. A credential can reach report strings in
+// any of these shapes, so every redaction channel must cover all of them.
+func credentialSecretVariants(secret string) []string {
+	if secret == "" {
+		return nil
+	}
+	encoded, _ := json.Marshal(secret)
+	jsonValue := string(encoded[1 : len(encoded)-1])
+	jsonUnescapedHTML := strings.NewReplacer(`\u003c`, "<", `\u003e`, ">", `\u0026`, "&").Replace(jsonValue)
+	variants := []string{
+		jsonValue,
+		jsonUnescapedHTML,
+		url.QueryEscape(secret),
+		url.PathEscape(secret),
+		base64.StdEncoding.EncodeToString([]byte(secret)),
+		base64.RawStdEncoding.EncodeToString([]byte(secret)),
+		base64.URLEncoding.EncodeToString([]byte(secret)),
+		base64.RawURLEncoding.EncodeToString([]byte(secret)),
+	}
+	// Drop equivalents identical to the raw value: the raw-value pass owns its
+	// own mask semantics, and a duplicate would force full masking during a
+	// partial redaction. De-duplication also covers encodings that coincide for
+	// simple inputs, such as query and path escaping.
+	distinct := variants[:0]
+	seen := map[string]struct{}{secret: {}}
+	for _, variant := range variants {
+		if _, ok := seen[variant]; ok {
+			continue
+		}
+		seen[variant] = struct{}{}
+		distinct = append(distinct, variant)
+	}
+	return distinct
+}
+
+// credentialEncodedSecretsForRedaction expands every credential into its raw
+// value and encoded equivalents, de-duplicates the result, and orders the
+// variants longest-first so overlapping credentials redact by longest match.
+func credentialEncodedSecretsForRedaction(secrets []string) []string {
 	variants := make([]string, 0, len(secrets)*9)
 	for _, secret := range secrets {
 		if secret == "" {
 			continue
 		}
-		encoded, _ := json.Marshal(secret)
-		jsonValue := string(encoded[1 : len(encoded)-1])
-		jsonUnescapedHTML := strings.NewReplacer(`\u003c`, "<", `\u003e`, ">", `\u0026`, "&").Replace(jsonValue)
-		variants = append(variants, secret, jsonValue, jsonUnescapedHTML,
-			url.QueryEscape(secret), url.PathEscape(secret),
-			base64.StdEncoding.EncodeToString([]byte(secret)),
-			base64.RawStdEncoding.EncodeToString([]byte(secret)),
-			base64.URLEncoding.EncodeToString([]byte(secret)),
-			base64.RawURLEncoding.EncodeToString([]byte(secret)))
+		variants = append(variants, secret)
+		variants = append(variants, credentialSecretVariants(secret)...)
 	}
 	return credentialSecretsForRedaction(variants)
 }

@@ -109,14 +109,17 @@ func severityStyle(severity Severity, noColor bool) color.Style {
 // strings before analysis enters a report. Callers should include primary and
 // component values and all captures (Finding.CredentialValues supplies these).
 func SanitizeAnalysis(analysis Analysis, secrets []string) Analysis {
-	secrets = credentialSecretsForRedaction(secrets)
+	// Raw, URL-encoded, JSON-escaped, and Base64 equivalents can all appear in
+	// provider-controlled strings, including status and analysis metadata; the
+	// same expanded set covers every analysis field and the debug diagnostics.
+	secrets = credentialEncodedSecretsForRedaction(secrets)
 	analysis.Capabilities = append([]Capability(nil), analysis.Capabilities...)
 	analysis.StatusReason = sanitizeCredentialString(analysis.StatusReason, secrets)
 	analysis.StatusMetadata = sanitizeCredentialMetadata(analysis.StatusMetadata, secrets, false)
 	analysis.Reason = sanitizeCredentialString(analysis.Reason, secrets)
 	analysis.Metadata = sanitizeCredentialMetadata(analysis.Metadata, secrets, false)
 	if len(analysis.Debug) > 0 {
-		analysis.Debug = sanitizeCredentialMetadata(analysis.Debug, credentialDebugSecretsForRedaction(secrets), true)
+		analysis.Debug = sanitizeCredentialMetadata(analysis.Debug, secrets, true)
 	}
 	if analysis.Identity == nil {
 		return analysis

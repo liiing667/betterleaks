@@ -5,6 +5,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/betterleaks/betterleaks/v2/internal/confidence"
@@ -159,11 +160,16 @@ type ComponentFinding struct {
 func (f *Finding) Redact(percent uint) {
 	secrets := f.CredentialValues()
 
-	// Replace all primary and component values in each match and its surrounding
-	// text. Longest values win when credentials overlap; replacements are applied
-	// once so masking one value cannot expose or corrupt another.
+	// Replace primary and component values plus their encoded equivalents in
+	// every match and its surrounding text. Longest values win when credentials
+	// overlap; each replacement pair is applied once by the replacer so masking
+	// one value cannot expose or corrupt another. Raw values keep the requested
+	// partial-mask semantics, while URL-encoded, JSON-escaped, and Base64
+	// equivalents are always fully masked because partial visibility of an
+	// encoded form would still disclose credential bytes.
 	secrets = credentialSecretsForRedaction(secrets)
-	pairs := make([]string, 0, len(secrets)*2)
+	rawPairs := make([]string, 0, len(secrets)*2)
+	encodedPairs := make(map[string]string, len(secrets)*8)
 	for _, secret := range secrets {
 		masked := "REDACTED"
 		if percent < 100 {
@@ -178,30 +184,57 @@ func (f *Finding) Redact(percent uint) {
 				}
 			}
 		}
-		pairs = append(pairs, secret, masked)
+		rawPairs = append(rawPairs, secret, masked)
+		for _, variant := range credentialSecretVariants(secret) {
+			encodedPairs[variant] = "REDACTED"
+		}
 	}
-	replacer := strings.NewReplacer(pairs...)
+	// Encoded equivalents are replaced in a first pass so a partially masked
+	// raw value cannot match the prefix of a Base64 or escaped form and leave
+	// the remainder of the equivalent exposed. Variants within each pass are
+	// ordered longest-first; the replacer also resolves overlaps by longest
+	// match. Raw values follow in the second pass with their mask semantics.
+	type replacementPair struct {
+		old string
+		new string
+	}
+	encodedPairList := make([]replacementPair, 0, len(encodedPairs))
+	for variant, masked := range encodedPairs {
+		encodedPairList = append(encodedPairList, replacementPair{variant, masked})
+	}
+	sort.Slice(encodedPairList, func(i, j int) bool {
+		return len(encodedPairList[i].old) > len(encodedPairList[j].old)
+	})
+	encodedPairsList := make([]string, 0, len(encodedPairList)*2)
+	for _, pair := range encodedPairList {
+		encodedPairsList = append(encodedPairsList, pair.old, pair.new)
+	}
+	encodedReplacer := strings.NewReplacer(encodedPairsList...)
+	replacer := strings.NewReplacer(rawPairs...)
+	replaceAll := func(value string) string {
+		return replacer.Replace(encodedReplacer.Replace(value))
+	}
 	redactMatch := func(match *Match) {
-		match.Full = replacer.Replace(match.Full)
-		match.Value = replacer.Replace(match.Value)
-		match.Captures = redactStrings(match.Captures, replacer.Replace)
-		match.Line = replacer.Replace(match.Line)
-		match.Context = replacer.Replace(match.Context)
+		match.Full = replaceAll(match.Full)
+		match.Value = replaceAll(match.Value)
+		match.Captures = redactStrings(match.Captures, replaceAll)
+		match.Line = replaceAll(match.Line)
+		match.Context = replaceAll(match.Context)
 	}
-	f.RuleID = replacer.Replace(f.RuleID)
-	f.Description = replacer.Replace(f.Description)
-	f.Confidence = replacer.Replace(f.Confidence)
-	f.Location.Path = replacer.Replace(f.Location.Path)
-	f.Attributes = redactStrings(f.Attributes, replacer.Replace)
+	f.RuleID = replaceAll(f.RuleID)
+	f.Description = replaceAll(f.Description)
+	f.Confidence = replaceAll(f.Confidence)
+	f.Location.Path = replaceAll(f.Location.Path)
+	f.Attributes = redactStrings(f.Attributes, replaceAll)
 	for i := range f.Tags {
-		f.Tags[i] = replacer.Replace(f.Tags[i])
+		f.Tags[i] = replaceAll(f.Tags[i])
 	}
 	redactMatch(&f.Match)
 	for _, set := range f.ComponentSets {
 		for i := range set.Components {
 			component := &set.Components[i]
-			component.RuleID = replacer.Replace(component.RuleID)
-			component.Location.Path = replacer.Replace(component.Location.Path)
+			component.RuleID = replaceAll(component.RuleID)
+			component.Location.Path = replaceAll(component.Location.Path)
 			redactMatch(&component.Match)
 		}
 	}
